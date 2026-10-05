@@ -1,0 +1,141 @@
+# Slesty batch runner - PUBLIC repo, zero content.
+#
+# SECURITY MODEL (same non-negotiables as slesty-ci, hardened for
+# CONTENT):
+#
+#   1. NOTHING from the private repos is ever stored here: no queue
+#      (it names artists), no downloads, no zips, no logs. Public-repo
+#      artifacts and releases are downloadable by ANYONE with the URL.
+#   2. The run log stays CONTENT-FREE: no artist names, no track
+#      titles, no ASINs. The worker binary + driver enforce this.
+#   3. All credentials ride in THIS repo's encrypted secrets:
+#        SLESTY_WORKER_DEPLOY_KEY : read-only SSH key for slesty-worker
+#        SLESTY_VAULT_TOKEN        : fine-grained PAT, contents:rw on
+#                                    ryyr-ry/slesty-vault ONLY
+#        SLESTY_CREDS             : slesty device credentials JSON
+#   4. Output zips go straight to the PRIVATE slesty-vault release.
+#
+# Flow: clone the private worker (code + queue) with the deploy key ->
+# build the worker -> fetch the slesty binary from the private vault
+# release tagged 'slesty-bin' -> plan (counts only) -> parallel download
+# via scripts/run.sh -> split zip -> upload to slesty-vault.
+
+name: batch
+
+on:
+  workflow_dispatch:
+    inputs:
+      parallel:
+        description: "Download processes in flight (default 8)"
+        required: false
+        default: "8"
+      max_minutes:
+        description: "Hard stop for the whole run (default 180)"
+        required: false
+        default: "180"
+
+permissions: {}
+
+env:
+  WORKER_REPO: ryyr-ry/slesty-worker
+  VAULT_REPO: ryyr-ry/slesty-vault
+
+jobs:
+  batch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ fromJSON(github.event.inputs.max_minutes || '180') }}
+    steps:
+      - name: Normalize the worker deploy key
+        shell: bash
+        run: |
+          mkdir -p "$HOME/.ssh"
+          printf '%s' "$SLESTY_WORKER_DEPLOY_KEY" | tr -d '\r' > "$HOME/.ssh/id_ed25519"
+          printf '\n' >> "$HOME/.ssh/id_ed25519"
+          chmod 600 "$HOME/.ssh/id_ed25519"
+          ssh-keygen -y -f "$HOME/.ssh/id_ed25519" > /dev/null || { echo "key parse failed"; exit 1; }
+          ssh-keyscan -t ed25519 github.com >> "$HOME/.ssh/known_hosts" 2>/dev/null
+        env:
+          SLESTY_WORKER_DEPLOY_KEY: ${{ secrets.SLESTY_WORKER_DEPLOY_KEY }}
+
+      - name: Clone the private worker (code + queue; read-only)
+        shell: bash
+        run: |
+          GIT_SSH_COMMAND="ssh -i $HOME/.ssh/id_ed25519 -o IdentitiesOnly=yes" \
+            git clone --depth 1 "git@github.com:${WORKER_REPO}.git" worker
+          echo "worker revision: $(cd worker && git rev-parse --short HEAD)"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protoc + zip
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler zip
+          echo "PROTOC=$(command -v protoc)" >> "$GITHUB_ENV"
+
+      - name: Build the worker
+        run: cargo build --release
+        working-directory: worker
+
+      - name: Fetch the slesty binary (private vault release)
+        env:
+          GH_TOKEN: ${{ secrets.SLESTY_VAULT_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release download slesty-bin --repo "$VAULT_REPO" \
+            --pattern 'slesty-linux-x64*' --output slesty --clobber \
+            || { echo "slesty binary missing in vault: publish it once (see README)"; exit 1; }
+          chmod +x slesty
+
+      - name: Stage credentials (secret -> runner-only dir)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/slesty-creds"
+          printf '%s' "$SLESTY_CREDS" > "$RUNNER_TEMP/slesty-creds/_index_probe"
+          rm -f "$RUNNER_TEMP/slesty-creds/_index_probe"
+          mkdir -p "$RUNNER_TEMP/slesty-creds/accounts"
+          printf '%s' "$SLESTY_CREDS" > "$RUNNER_TEMP/slesty-creds/accounts/device.json"
+          echo "SLESTY_CRED_DIR=$RUNNER_TEMP/slesty-creds" >> "$GITHUB_ENV"
+        env:
+          SLESTY_CREDS: ${{ secrets.SLESTY_CREDS }}
+
+      - name: Plan (counts only)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/run"
+          cp worker/jobs/queue/job.json "$RUNNER_TEMP/run/job.json"
+          ./worker/target/release/slesty-worker \
+            "$RUNNER_TEMP/run/job.json" "$RUNNER_TEMP/run/remaining.json"
+
+      - name: Download + zip + upload (driver; per-request logs stay in RUNNER_TEMP)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.SLESTY_VAULT_TOKEN }}
+          SLESTY_QUALITY: UHD
+          SLESTY_OUT: ${{ runner.temp }}/music
+        run: |
+          set -euo pipefail
+          export RUNNER_TEMP
+          bash worker/scripts/run.sh \
+            "$RUNNER_TEMP/run/manifest.txt" \
+            "$RUNNER_TEMP/music" \
+            "$VAULT_REPO" \
+            "batch-${{ github.run_number }}" \
+            "${{ github.event.inputs.parallel || '8' }}"
+
+      - name: Summary (counts only)
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## batch summary"
+            echo "- run: ${{ github.run_number }}"
+            if [ -d "$RUNNER_TEMP/music" ]; then
+              echo "- files: $(find "$RUNNER_TEMP/music" -type f | wc -l)"
+            fi
+            if ls "$RUNNER_TEMP"/failed_* > /dev/null 2>&1; then
+              echo "- failed requests: $(ls "$RUNNER_TEMP"/failed_* | wc -l)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

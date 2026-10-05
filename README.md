@@ -17,8 +17,7 @@ and never stores any output.**
 
 | Secret | What it is |
 |---|---|
-| `SLESTY_WORKER_DEPLOY_KEY` | read-only SSH deploy key for slesty-worker |
-| `SLESTY_VAULT_TOKEN` | fine-grained PAT: contents read/write on slesty-vault ONLY |
+| `SLESTY_RUNNER_TOKEN` | fine-grained PAT: Contents rw on slesty-worker + slesty-vault only |
 | `SLESTY_CREDS` | the registered device credentials JSON for slesty |
 
 ## Usage

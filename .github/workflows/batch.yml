@@ -23,6 +23,13 @@ name: batch
 on:
   workflow_dispatch:
     inputs:
+      label:
+        description: "Human-readable release name, e.g. 'Imagine Dragons - complete (81 tracks, UHD)'"
+        required: true
+      description:
+        description: "Short description shown on the release (optional)"
+        required: false
+        default: ""
       parallel:
         description: "Download processes in flight (default 8)"
         required: false
@@ -108,6 +115,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.SLESTY_RUNNER_TOKEN }}
           SLESTY_QUALITY: UHD
+          RELEASE_LABEL: ${{ github.event.inputs.label }}
+          RELEASE_DESC: ${{ github.event.inputs.description }}
         run: |
           set -euo pipefail
           export RUNNER_TEMP
